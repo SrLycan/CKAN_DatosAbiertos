@@ -20,14 +20,12 @@ const CKAN_BASE       = process.env.CKAN_BASE_URL || "https://datosabiertos.pres
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,http://localhost:5173").split(",");
 
 // ── Clientes Supabase ─────────────────────────────────────────────────────────
-// service_role: bypasa RLS → operaciones del backend
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   { auth: { persistSession: false, autoRefreshToken: false } }
 );
 
-// anon: respeta RLS → solo para verificar tokens
 const supabaseAnon = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY,
@@ -50,17 +48,28 @@ function setCache(key, data, ttl = 300) {
 const ckanClient = axios.create({
   baseURL: CKAN_BASE,
   timeout: 12000,
-  headers: { "User-Agent": "DatosabiertosEC-Dashboard/2.0" },
+  headers: {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "es-EC,es;q=0.9,en;q=0.8",
+    "Referer":         "https://datosabiertos.presidencia.gob.ec/",
+    "Origin":          "https://datosabiertos.presidencia.gob.ec",
+  },
 });
 
 async function ckan(action, params = {}, ttl = 300) {
   const key    = `${action}:${JSON.stringify(params)}`;
   const cached = ttl > 0 ? getCached(key) : null;
   if (cached) return cached;
-  const { data: body } = await ckanClient.get(`/${action}`, { params });
-  if (!body.success) throw new Error(`CKAN: ${body.error?.message || body.error?.type || "error"}`);
-  if (ttl > 0) setCache(key, body.result, ttl);
-  return body.result;
+  try {
+    const { data: body } = await ckanClient.get(`/${action}`, { params });
+    if (!body.success) throw new Error(`CKAN: ${body.error?.message || body.error?.type || "error"}`);
+    if (ttl > 0) setCache(key, body.result, ttl);
+    return body.result;
+  } catch (err) {
+    console.error(`[CKAN ERROR] action=${action} | code=${err.code} | status=${err.response?.status} | msg=${err.message}`);
+    throw err;
+  }
 }
 
 // ── Middleware global ─────────────────────────────────────────────────────────
@@ -97,7 +106,6 @@ async function requireAuth(req, res, next) {
 }
 
 // ── Audit log helper ──────────────────────────────────────────────────────────
-// FIX: usa supabaseAdmin para insertar (bypasa RLS) y guarda email como TEXT
 async function auditLog(userId, userEmail, action, period, filename, ip) {
   try {
     await supabaseAdmin
@@ -112,7 +120,6 @@ async function auditLog(userId, userEmail, action, period, filename, ip) {
 //  RUTAS ADMIN
 // ════════════════════════════════════════════════════════════════════════════════
 
-// POST /api/admin/periods — Subir o actualizar un período
 app.post("/api/admin/periods", requireAuth, async (req, res) => {
   const { period_label, period_start, period_end, filename, processed_data } = req.body;
 
@@ -134,7 +141,7 @@ app.post("/api/admin/periods", requireAuth, async (req, res) => {
           filename,
           processed_data,
           uploaded_by:       req.user.id,
-          uploaded_by_email: req.user.email,   // ← guardamos email directo, sin JOIN
+          uploaded_by_email: req.user.email,
           updated_at:        new Date().toISOString(),
         },
         { onConflict: "period_label" }
@@ -152,7 +159,6 @@ app.post("/api/admin/periods", requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/admin/periods/:id
 app.delete("/api/admin/periods/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   try {
@@ -184,7 +190,6 @@ app.delete("/api/admin/periods/:id", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/admin/audit
 app.get("/api/admin/audit", requireAuth, async (req, res) => {
   const { data, error } = await supabaseAdmin
     .from("admin_audit_log")
@@ -200,7 +205,6 @@ app.get("/api/admin/audit", requireAuth, async (req, res) => {
   res.json({ logs: data || [] });
 });
 
-// POST /api/cache/clear
 app.post("/api/cache/clear", requireAuth, (req, res) => {
   const size = cache.size;
   cache.clear();
@@ -211,7 +215,6 @@ app.post("/api/cache/clear", requireAuth, (req, res) => {
 //  RUTAS PÚBLICAS — PERÍODOS
 // ════════════════════════════════════════════════════════════════════════════════
 
-// GET /api/periods — lista ligera (usa la vista, sin auth.users)
 app.get("/api/periods", async (_req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -226,7 +229,6 @@ app.get("/api/periods", async (_req, res) => {
   }
 });
 
-// GET /api/periods/latest
 app.get("/api/periods/latest", async (_req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -247,7 +249,6 @@ app.get("/api/periods/latest", async (_req, res) => {
   }
 });
 
-// GET /api/periods/:id
 app.get("/api/periods/:id", async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -401,6 +402,17 @@ app.get("/api/portal/stats", async (_req, res) => {
       ckan("package_search", { rows: 5, sort: "metadata_modified desc" }, 120),
       ckan("recently_changed_packages_activity_list", { limit: 8 }, 90),
     ]);
+
+    // Log de diagnóstico — qué llamadas fallaron y cuáles pasaron
+    [pkgSearch, orgList, grpList, recentPkg, activityList].forEach((r, i) => {
+      const names = ["package_search", "organization_list", "group_list", "package_search(recent)", "activity_list"];
+      if (r.status === "rejected") {
+        console.error(`[CKAN STATS] ❌ ${names[i]} falló: ${r.reason?.message}`);
+      } else {
+        console.log(`[CKAN STATS] ✅ ${names[i]} OK`);
+      }
+    });
+
     const pkg    = pkgSearch.status    === "fulfilled" ? pkgSearch.value    : {};
     const orgs   = orgList.status      === "fulfilled" ? orgList.value      : [];
     const groups = grpList.status      === "fulfilled" ? grpList.value      : [];
