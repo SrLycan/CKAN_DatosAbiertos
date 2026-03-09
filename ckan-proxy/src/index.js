@@ -1,4 +1,5 @@
 const CKAN_BASE = "https://datosabiertos.presidencia.gob.ec/api/3/action";
+// v2 — timeout extendido + respuesta como texto para evitar re-parse
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -30,25 +31,39 @@ export default {
     const ckanUrl = `${CKAN_BASE}/${action}${url.search}`;
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 25000);
+
       const response = await fetch(ckanUrl, {
+        signal: controller.signal,
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept": "application/json",
-          "Referer": "https://datosabiertos.presidencia.gob.ec/",
+          "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept":          "application/json, text/plain, */*",
+          "Accept-Language": "es-EC,es;q=0.9,en;q=0.8",
+          "Referer":         "https://datosabiertos.presidencia.gob.ec/",
+          "Origin":          "https://datosabiertos.presidencia.gob.ec",
         },
       });
 
-      const data = await response.json();
+      clearTimeout(timeoutId);
 
-      return new Response(JSON.stringify(data), {
+      // Devolver el texto directo sin re-parsear para evitar errores
+      const text = await response.text();
+
+      return new Response(text, {
         status: response.status,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
       });
+
     } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 502,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      const isTimeout = err.name === "AbortError";
+      return new Response(
+        JSON.stringify({ error: isTimeout ? "CKAN timeout" : err.message }),
+        {
+          status: isTimeout ? 504 : 502,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        }
+      );
     }
   },
 };
