@@ -3,7 +3,7 @@ const express      = require("express");
 const axios        = require("axios");
 const cors         = require("cors");
 const helmet       = require("helmet");
-const rateLimit    = require("express-rate-limit");   // npm install express-rate-limit
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit"); // cambia esta línea del require
 const { createClient } = require("@supabase/supabase-js");
 
 const app  = express();
@@ -103,8 +103,8 @@ const ckanLimiter = rateLimit({
   legacyHeaders:   false,
   handler: retryAfterMessage(WINDOW_MS),
   keyGenerator: (req) => {
-    // Soporta proxies / load balancers que usen X-Forwarded-For
-    return req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
+    const forwarded = req.headers["x-forwarded-for"]?.split(",")[0].trim();
+    return ipKeyGenerator(forwarded || req.ip);
   },
 });
 
