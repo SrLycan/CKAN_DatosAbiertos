@@ -1,8 +1,9 @@
 require("dotenv").config();
-const express  = require("express");
-const axios    = require("axios");
-const cors     = require("cors");
-const helmet   = require("helmet");
+const express      = require("express");
+const axios        = require("axios");
+const cors         = require("cors");
+const helmet       = require("helmet");
+const rateLimit    = require("express-rate-limit");   // npm install express-rate-limit
 const { createClient } = require("@supabase/supabase-js");
 
 const app  = express();
@@ -20,14 +21,12 @@ const CKAN_BASE       = process.env.CKAN_BASE_URL || "https://datosabiertos.pres
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,http://localhost:5173").split(",");
 
 // ── Clientes Supabase ─────────────────────────────────────────────────────────
-// service_role: bypasa RLS → operaciones del backend
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   { auth: { persistSession: false, autoRefreshToken: false } }
 );
 
-// anon: respeta RLS → solo para verificar tokens
 const supabaseAnon = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY,
@@ -63,8 +62,78 @@ async function ckan(action, params = {}, ttl = 300) {
   return body.result;
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  RATE LIMITERS
+//  Ventana de 15 minutos. Ajusta max según tu tráfico esperado.
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Formatea el tiempo restante en un mensaje legible
+function retryAfterMessage(windowMs) {
+  return (_req, res) => {
+    const retryAfter = Math.ceil(windowMs / 1000 / 60);
+    res.status(429).json({
+      error:       "Demasiadas solicitudes",
+      message:     `Has superado el límite de peticiones. Intenta de nuevo en ${retryAfter} minutos.`,
+      retry_after: `${retryAfter} minutos`,
+    });
+  };
+}
+
+const WINDOW_MS = 15 * 60 * 1000; // 15 minutos
+
+// 1. Límite GLOBAL — protege todo el servidor (primera línea de defensa)
+const globalLimiter = rateLimit({
+  windowMs: WINDOW_MS,
+  max:      500,           // 500 req / IP / 15 min en cualquier ruta
+  standardHeaders: true,   // Envía RateLimit-* headers al cliente
+  legacyHeaders:   false,
+  handler: retryAfterMessage(WINDOW_MS),
+  skip: (req) => {
+    // No limitar health checks (útil para monitores como UptimeRobot)
+    return req.path === "/health";
+  },
+});
+
+// 2. Límite CKAN — rutas /api/portal/* (las que llaman a CKAN externo)
+//    200 req / IP / 15 min  → ~13 req/min, razonable para un dashboard
+const ckanLimiter = rateLimit({
+  windowMs: WINDOW_MS,
+  max:      200,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  handler: retryAfterMessage(WINDOW_MS),
+  keyGenerator: (req) => {
+    // Soporta proxies / load balancers que usen X-Forwarded-For
+    return req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
+  },
+});
+
+// 3. Límite ADMIN — rutas protegidas por auth (más permisivo, son usuarios reales)
+const adminLimiter = rateLimit({
+  windowMs: WINDOW_MS,
+  max:      100,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  handler: retryAfterMessage(WINDOW_MS),
+});
+
+// 4. Límite ESTRICTO — para endpoints sensibles como /cache/clear
+const strictLimiter = rateLimit({
+  windowMs: WINDOW_MS,
+  max:      10,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  handler: retryAfterMessage(WINDOW_MS),
+});
+
 // ── Middleware global ─────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
+
+
+app.set("trust proxy", 1);
+
+app.use(globalLimiter); // ← Se aplica a TODAS las rutas
+
 app.use(cors({
   origin: (origin, cb) =>
     (!origin || ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes("*"))
@@ -97,7 +166,6 @@ async function requireAuth(req, res, next) {
 }
 
 // ── Audit log helper ──────────────────────────────────────────────────────────
-// FIX: usa supabaseAdmin para insertar (bypasa RLS) y guarda email como TEXT
 async function auditLog(userId, userEmail, action, period, filename, ip) {
   try {
     await supabaseAdmin
@@ -109,11 +177,10 @@ async function auditLog(userId, userEmail, action, period, filename, ip) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  RUTAS ADMIN
+//  RUTAS ADMIN  (adminLimiter aplicado por ruta)
 // ════════════════════════════════════════════════════════════════════════════════
 
-// POST /api/admin/periods — Subir o actualizar un período
-app.post("/api/admin/periods", requireAuth, async (req, res) => {
+app.post("/api/admin/periods", adminLimiter, requireAuth, async (req, res) => {
   const { period_label, period_start, period_end, filename, processed_data } = req.body;
 
   if (!period_label || !period_start || !period_end || !filename || !processed_data) {
@@ -134,7 +201,7 @@ app.post("/api/admin/periods", requireAuth, async (req, res) => {
           filename,
           processed_data,
           uploaded_by:       req.user.id,
-          uploaded_by_email: req.user.email,   // ← guardamos email directo, sin JOIN
+          uploaded_by_email: req.user.email,
           updated_at:        new Date().toISOString(),
         },
         { onConflict: "period_label" }
@@ -152,8 +219,7 @@ app.post("/api/admin/periods", requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/admin/periods/:id
-app.delete("/api/admin/periods/:id", requireAuth, async (req, res) => {
+app.delete("/api/admin/periods/:id", adminLimiter, requireAuth, async (req, res) => {
   const { id } = req.params;
   try {
     const { data: existing } = await supabaseAdmin
@@ -184,8 +250,7 @@ app.delete("/api/admin/periods/:id", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/admin/audit
-app.get("/api/admin/audit", requireAuth, async (req, res) => {
+app.get("/api/admin/audit", adminLimiter, requireAuth, async (req, res) => {
   const { data, error } = await supabaseAdmin
     .from("admin_audit_log")
     .select("*")
@@ -200,8 +265,8 @@ app.get("/api/admin/audit", requireAuth, async (req, res) => {
   res.json({ logs: data || [] });
 });
 
-// POST /api/cache/clear
-app.post("/api/cache/clear", requireAuth, (req, res) => {
+// strictLimiter en cache/clear — muy sensible
+app.post("/api/cache/clear", strictLimiter, requireAuth, (req, res) => {
   const size = cache.size;
   cache.clear();
   res.json({ cleared: size, message: "Cache vaciada" });
@@ -211,7 +276,6 @@ app.post("/api/cache/clear", requireAuth, (req, res) => {
 //  RUTAS PÚBLICAS — PERÍODOS
 // ════════════════════════════════════════════════════════════════════════════════
 
-// GET /api/periods — lista ligera (usa la vista, sin auth.users)
 app.get("/api/periods", async (_req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -226,7 +290,6 @@ app.get("/api/periods", async (_req, res) => {
   }
 });
 
-// GET /api/periods/latest
 app.get("/api/periods/latest", async (_req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -247,7 +310,6 @@ app.get("/api/periods/latest", async (_req, res) => {
   }
 });
 
-// GET /api/periods/:id
 app.get("/api/periods/:id", async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -277,10 +339,10 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  RUTAS CKAN
+//  RUTAS CKAN  (ckanLimiter aplicado a todas)
 // ════════════════════════════════════════════════════════════════════════════════
 
-app.get("/api/portal/summary", async (_req, res) => {
+app.get("/api/portal/summary", ckanLimiter, async (_req, res) => {
   try {
     const [pkgResult, orgList, grpList] = await Promise.all([
       ckan("package_search", { rows: 0, facet: "true", "facet.field": JSON.stringify(["res_format"]), "facet.limit": 5 }),
@@ -300,7 +362,7 @@ app.get("/api/portal/summary", async (_req, res) => {
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
-app.get("/api/portal/recent", async (req, res) => {
+app.get("/api/portal/recent", ckanLimiter, async (req, res) => {
   const rows = Math.min(parseInt(req.query.rows) || 5, 20);
   const sort = req.query.sort || "metadata_modified desc";
   try {
@@ -319,7 +381,7 @@ app.get("/api/portal/recent", async (req, res) => {
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
-app.get("/api/portal/groups", async (_req, res) => {
+app.get("/api/portal/groups", ckanLimiter, async (_req, res) => {
   try {
     const groups = await ckan("group_list", { all_fields: "true", include_dataset_count: "true", include_extras: "true", limit: 500 });
     const sorted = (Array.isArray(groups) ? groups : [])
@@ -330,7 +392,7 @@ app.get("/api/portal/groups", async (_req, res) => {
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
-app.get("/api/portal/organizations", async (req, res) => {
+app.get("/api/portal/organizations", ckanLimiter, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 20, 500);
   try {
     const orgs = await ckan("organization_list", { all_fields: "true", include_dataset_count: "true", sort: "package_count desc", limit });
@@ -341,14 +403,14 @@ app.get("/api/portal/organizations", async (req, res) => {
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
-app.get("/api/portal/formats", async (_req, res) => {
+app.get("/api/portal/formats", ckanLimiter, async (_req, res) => {
   try {
     const result = await ckan("package_search", { rows: 0, facet: "true", "facet.field": JSON.stringify(["res_format"]), "facet.limit": 20 });
     res.json({ formats: (result.search_facets?.res_format?.items ?? []).sort((a, b) => b.count - a.count), fetched_at: new Date().toISOString() });
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
-app.get("/api/portal/activity", async (req, res) => {
+app.get("/api/portal/activity", ckanLimiter, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 10, 30);
   try {
     const activity = await ckan("recently_changed_packages_activity_list", { limit }, 90);
@@ -361,7 +423,7 @@ app.get("/api/portal/activity", async (req, res) => {
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
-app.get("/api/portal/search", async (req, res) => {
+app.get("/api/portal/search", ckanLimiter, async (req, res) => {
   const { q = "", rows = "10", sort = "metadata_modified desc", fq = "", start = "0" } = req.query;
   try {
     const result = await ckan("package_search", {
@@ -383,7 +445,7 @@ app.get("/api/portal/search", async (req, res) => {
   } catch (err) { res.status(502).json({ error: err.message }); }
 });
 
-app.get("/api/portal/dataset/:id", async (req, res) => {
+app.get("/api/portal/dataset/:id", ckanLimiter, async (req, res) => {
   try {
     const dataset = await ckan("package_show", { id: req.params.id }, 600);
     res.json({ dataset, fetched_at: new Date().toISOString() });
@@ -392,7 +454,7 @@ app.get("/api/portal/dataset/:id", async (req, res) => {
   }
 });
 
-app.get("/api/portal/stats", async (_req, res) => {
+app.get("/api/portal/stats", ckanLimiter, async (_req, res) => {
   try {
     const [pkgSearch, orgList, grpList, recentPkg, activityList] = await Promise.allSettled([
       ckan("package_search", { rows: 0, facet: "true", "facet.field": JSON.stringify(["res_format", "organization", "groups"]), "facet.limit": 500 }),
@@ -446,6 +508,23 @@ app.listen(PORT, () => {
 ║  DELETE /api/admin/periods/:id   → Eliminar (auth)       ║
 ║  GET    /api/admin/audit         → Log de acciones       ║
 ║  GET    /health                  → Estado del servidor   ║
+╠══════════════════════════════════════════════════════════╣
+║  CKAN  /api/portal/*                                    ║
+║  GET   /api/portal/summary       → Resumen general      ║
+║  GET   /api/portal/recent        → Datasets recientes   ║
+║  GET   /api/portal/groups        → Grupos               ║
+║  GET   /api/portal/organizations → Organizaciones       ║
+║  GET   /api/portal/formats       → Formatos             ║
+║  GET   /api/portal/activity      → Actividad reciente   ║
+║  GET   /api/portal/search        → Búsqueda             ║
+║  GET   /api/portal/dataset/:id   → Dataset por ID       ║
+║  GET   /api/portal/stats         → Estadísticas         ║
+╠══════════════════════════════════════════════════════════╣
+║  RATE LIMITS (por IP / 15 min)                          ║
+║  Global:       500 req  → todo el servidor              ║
+║  CKAN:         200 req  → /api/portal/*                 ║
+║  Admin:        100 req  → /api/admin/*                  ║
+║  Strict:        10 req  → /api/cache/clear              ║
 ╚══════════════════════════════════════════════════════════╝
   `);
 });
