@@ -165,14 +165,31 @@ app.set("trust proxy", 1);
 // Aplica el limitador global a TODAS las rutas antes de cualquier otra lógica
 app.use(globalLimiter);
 
-// Configura CORS: solo permite peticiones desde los orígenes declarados en .env
+// ── CORS ─────────────────────────────────────────────────────────────────────
+// Acepta:
+//   1. Peticiones sin origen (Postman, curl, health checks internos)
+//   2. Cualquier subdominio de *.vercel.app  (producción + previews de Vercel)
+//   3. Orígenes explícitos declarados en ALLOWED_ORIGINS (.env)
+//   4. El comodín "*" en ALLOWED_ORIGINS desactiva todas las restricciones
 app.use(cors({
-  origin: (origin, cb) =>
-    (!origin || ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes("*"))
-      ? cb(null, true)
-      : cb(new Error(`CORS bloqueado: ${origin}`)),
+  origin: (origin, cb) => {
+    // Sin origen → permitir (curl, Postman, monitores internos)
+    if (!origin) return cb(null, true);
+
+    // Cualquier subdominio de Vercel → permitir siempre
+    if (/\.vercel\.app$/.test(origin)) return cb(null, true);
+
+    // Orígenes explícitos del .env → permitir
+    if (ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes("*")) {
+      return cb(null, true);
+    }
+
+    // El resto → bloquear
+    return cb(new Error(`CORS bloqueado: ${origin}`));
+  },
   methods: ["GET", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
 }));
 
 // Parsea cuerpos JSON con límite de 50 MB (para uploads de archivos procesados)
